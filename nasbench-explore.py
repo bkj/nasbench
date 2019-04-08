@@ -13,15 +13,18 @@
 from rsub import *
 from matplotlib import pyplot as plt
 
+import json
+import pickle
 import numpy as np
 import pandas as pd
 from tqdm import trange, tqdm
+from collections import defaultdict
 
 import sklearn
 import sklearn.compose
 import sklearn.impute
 import sklearn.feature_selection
-from sklearn.svm import LinearSVR
+from sklearn.svm import LinearSVR, SVR
 
 import nasbench
 from nasbench.api import NASBench
@@ -31,6 +34,14 @@ OUTPUT     = 'output'
 CONV1X1    = 'conv1x1-bn-relu'
 CONV3X3    = 'conv3x3-bn-relu'
 MAXPOOL3X3 = 'maxpool3x3'
+
+label_lookup = {
+    -1 : INPUT,
+    -2 : OUTPUT,
+    0  : CONV3X3,
+    1  : CONV1X1,
+    2  : MAXPOOL3X3,
+}
 
 # --
 # Helpers
@@ -43,6 +54,12 @@ cummax = np.maximum.accumulate
 
 path = 'data/nasbench_only108.tfrecord'
 api  = NASBench(path)
+
+graphs = pd.read_json('data/all-graphs.gz', lines=True)
+graphs = graphs.sort_values('hash').reset_index(drop=True)
+graphs = graphs[['hash', 'labeling', 'adj']]
+
+graphs['num_nodes'] = graphs.labeling.apply(len)
 
 # --
 # ETL
@@ -66,40 +83,69 @@ z_max = z_all.max()
 # validation acc     maximum across 3 runs        0.9518229365348816
 
 # --
-# Clean
+# Clean data
+
+def make_edges(num_nodes):
+    edges = []
+    for idx in range(num_nodes ** 2):
+        row = idx // num_nodes
+        col = idx %  num_nodes
+        if row < col:
+            edges.append(idx)
+            
+    return np.array(edges)
 
 class Prepper:
-    def _make_edges(self, num_nodes):
-        edges = []
-        for idx in range(num_nodes ** 2):
-            row = idx // num_nodes
-            col = idx %  num_nodes
-            if row < col:
-                edges.append(idx)
-                
-        return np.array(edges)
-    
     def featurize_one(self, s, edges):
         edge_features = list(np.hstack(s['module_adjacency'])[edges].astype(np.float64))
         node_features = s['module_operations']
         return edge_features + node_features
     
-    def featurize_iter(self, specs, results, num_nodes=7):
-        edges = self._make_edges(num_nodes=num_nodes)
-        for s, r in tqdm(zip(specs, results), total=len(specs)):
+    def featurize_iter(self, specs, results, hashes, num_nodes=7):
+        edges = make_edges(num_nodes=num_nodes)
+        for s, r, h in tqdm(zip(specs, results, hashes), total=len(specs)):
             adj_num_nodes = s['module_adjacency'].shape[0]
             if adj_num_nodes == num_nodes:
-                X    = self.featurize_one(s, edges)
-                y    = np.mean([rr['final_validation_accuracy'] for rr in r])
-                z    = np.mean([rr['final_test_accuracy'] for rr in r])
-                cost = np.mean([rr['final_training_time'] for rr in r])
-                yield X, y, z, cost
+                X     = self.featurize_one(s, edges)
+                y     = np.mean([rr['final_validation_accuracy'] for rr in r])
+                z     = np.mean([rr['final_test_accuracy'] for rr in r])
+                cost  = np.mean([rr['final_training_time'] for rr in r])
+                yield X, y, z, cost, h
     
-    def featurize_all(self, specs, results, num_nodes=7):
-        gen = self.featurize_iter(specs, results, num_nodes=num_nodes)
-        X, y, z, cost = list(zip(*gen))
-        return X, np.array(y), np.array(z), np.array(cost)
+    def featurize_all(self, specs, results, hashes, num_nodes=7):
+        gen = self.featurize_iter(specs, results, hashes, num_nodes=num_nodes)
+        X, y, z, cost, hash_ = list(zip(*gen))
+        return X, np.array(y), np.array(z), np.array(cost), np.array(hash_)
 
+# Clean data
+X_5, y_5, z_5, cost_5, hash_5 = Prepper().featurize_all(specs, results, hashes, num_nodes=5)
+X_6, y_6, z_6, cost_6, hash_6 = Prepper().featurize_all(specs, results, hashes, num_nodes=6)
+X_7, y_7, z_7, cost_7, hash_7 = Prepper().featurize_all(specs, results, hashes, num_nodes=7)
+
+y_567    = np.hstack([y_5, y_6, y_7])
+z_567    = np.hstack([z_5, z_6, z_7])
+cost_567 = np.hstack([cost_5, cost_6, cost_7])
+hash_567 = np.hstack([hash_5, hash_6, hash_7])
+
+# --
+# Clean graphs
+
+# hash2feat = defaultdict(list)
+
+# for num_nodes in [5, 6, 7]:
+#     edges = make_edges(num_nodes=num_nodes)
+#     sub   = graphs[graphs.num_nodes == num_nodes]
+    
+#     for idx, row in tqdm(sub.iterrows(), total=sub.shape[0]):
+#         edge_features = list(np.hstack(row.adj)[edges].astype(np.float64))
+#         node_features = [label_lookup.get(xx) for xx in row.labeling]
+#         hash2feat[row.hash].append(edge_features + node_features)
+
+# tmp = '\n'.join([json.dumps({"hash"  : k, "feats" : v}) for k,v in hash2feat.items()])
+# _ = open('data/hash2feat.jl', 'w').write(tmp)
+
+hash2feat = pd.read_json('data/hash2feat.jl', lines=True)
+hash2feat = dict(zip(hash2feat.hash, hash2feat.feats))
 
 # --
 # Random search
@@ -120,28 +166,19 @@ def run_random(score, cost, models_per_run=1e4, n_repeats=500):
         
     return np.stack(running_scores), np.stack(running_costs)
 
-
-X_5, y_5, z_5, cost_5 = Prepper().featurize_all(specs, results, num_nodes=5)
-X_6, y_6, z_6, cost_6 = Prepper().featurize_all(specs, results, num_nodes=6)
-X_7, y_7, z_7, cost_7 = Prepper().featurize_all(specs, results, num_nodes=7)
-
-y_567    = np.hstack([y_5, y_6, y_7])
-z_567    = np.hstack([z_5, z_6, z_7])
-cost_567 = np.hstack([cost_5, cost_6, cost_7])
-
 running_scores = {}
 running_costs  = {}
 
-running_scores[5], running_costs[5] = run_random(z_5, cost_5)
-running_scores[6], running_costs[6] = run_random(z_6, cost_6)
-running_scores[7], running_costs[7] = run_random(z_7, cost_7)
-running_scores[0], running_costs[0] = run_random(z_567, cost_567)
+running_scores[5], running_costs[5] = run_random(y_5, cost_5)
+running_scores[6], running_costs[6] = run_random(y_6, cost_6)
+running_scores[7], running_costs[7] = run_random(y_7, cost_7)
+running_scores[0], running_costs[0] = run_random(y_567, cost_567)
 
 # --
 # Featurization
 
-num_nodes = 7
-X, y, z, cost = eval('X_%d, y_%d, z_%d, cost_%d' % (num_nodes, num_nodes, num_nodes, num_nodes))
+num_nodes = 6
+X, y, z, cost, hash_ = eval('X_%d, y_%d, z_%d, cost_%d, hash_%d' % tuple([num_nodes] * 5))
 
 num_edges       = np.arange(num_nodes).sum()
 numeric_indices = np.arange(num_edges)
@@ -174,42 +211,88 @@ Xf /= Xf.shape[1]
 
 # !! These results aren't comparable to 
 
-train_budget = 1e6
-test_budget  = 3e6
+def flatten(x):
+    out = [None] * sum(len(xx) for xx in x)
+    idx = 0
+    for xx in x:
+        for xxx in xx:
+            out[idx] = xxx
+            idx += 1
+    
+    return out
 
-model_scores = []
-for _ in trange(32):
-    
-    perm = np.random.permutation(Xf.shape[0])
-    
-    train_sel = perm[np.where(cost[perm].cumsum() <= train_budget)[0]]
-    test_sel  = perm[np.where(cost[perm].cumsum() > train_budget)[0]]
-    
-    Xf_train, Xf_test     = Xf[train_sel], Xf[test_sel]
-    y_train, _            = y[train_sel], y[test_sel]
-    z_train, z_test       = z[train_sel], z[test_sel]
-    cost_train, cost_test = cost[train_sel], cost[test_sel]
-    
-    model     = LinearSVR(C=1, max_iter=10000).fit(Xf_train, y_train)
-    pred_test = model.predict(Xf_test)
-    
-    pred_rank = pred_test.argsort()[::-1]
-    eval_sel  = pred_rank[cost_test[pred_rank].cumsum() < test_budget]
-    
-    train_best = y_train.max()
-    eval_best  = z_test[eval_sel].max()
-    
-    best = max(train_best, eval_best)
-    model_scores.append({
-        "budget" : np.cumsum(np.hstack([cost_train, cost_test[eval_sel]])),
-        "score"  : cummax(np.hstack([z_train, z_test[eval_sel]])),
-    })
-    # print(model_scores[-1]['score'][-1])
+
+augment_train = False
+augment_test  = False
+
+C = 1
+
+train_budget = 1e5
+test_budget  = 1e7
+
+meds = []
+for _ in range(10):
+    model_scores = []
+    for idx in range(32):
+        
+        perm = np.random.permutation(len(X))
+        
+        train_sel = perm[np.where(cost[perm].cumsum() <= train_budget)[0]]
+        test_sel  = perm[np.where(cost[perm].cumsum() > train_budget)[0]]
+        
+        Xf_train, Xf_test     = Xf[train_sel], Xf[test_sel]
+        hash_train, hash_test = hash_[train_sel], hash_[test_sel]
+        y_train, y_test       = y[train_sel], y[test_sel]
+        # z_train, z_test       = z[train_sel], z[test_sel]
+        cost_train, cost_test = cost[train_sel], cost[test_sel]
+        
+        if not augment_train:
+            model = LinearSVR(C=C, max_iter=10000).fit(Xf_train, y_train)
+        else:
+            X_train_aug  = sum([hash2feat[h] for h in hash_train], [])
+            Xf_train_aug = featurizer.transform(X_train_aug).astype(np.float64)
+            Xf_train_aug /= Xf_train_aug.shape[1]
+            
+            y_train_aug  = np.repeat(y_train, [len(hash2feat[h]) for h in hash_train])
+            model = LinearSVR(C=C, max_iter=10000).fit(Xf_train_aug, y_train_aug)
+        
+        if not augment_test:
+            pred_test = model.predict(Xf_test)
+        else:
+            X_test_aug  = flatten([hash2feat[h] for h in hash_test])
+            Xf_test_aug = featurizer.transform(X_test_aug).astype(np.float64)
+            Xf_test_aug /= Xf_test_aug.shape[1]
+            
+            key = np.repeat(hash_test, [len(hash2feat[h]) for h in hash_test])
+            
+            pred_test = model.predict(Xf_test_aug)
+            pred_test = pd.Series(pred_test).groupby(key).mean()
+            pred_test = pred_test.loc[hash_test].values
+            
+        
+        pred_rank = pred_test.argsort()[::-1]
+        eval_sel  = pred_rank[cost_test[pred_rank].cumsum() < test_budget]
+        
+        train_best = y_train.max()
+        eval_best  = y_test[eval_sel].max()
+        
+        best = max(train_best, eval_best)
+        model_scores.append({
+            "budget" : np.cumsum(np.hstack([cost_train, cost_test[eval_sel]])),
+            "score"  : cummax(np.hstack([y_train, y_test[eval_sel]])),
+        })
+        # print(model_scores[-1]['score'][-1])
+        
+    med = np.median([np.where(m['score'] == y_max)[0][0] for m in model_scores])
+    print(med)
+    meds.append(med)
+
+print(meds)
 
 # --
 # Plot
 
-r_max = z_max
+r_max = y_max
 for n, c in zip([0, 5, 6, 7], ['black', 'red', 'green', 'blue']):
     _ = plt.plot(running_costs[n].mean(axis=0), r_max - running_scores[n].mean(axis=0), c=c, label=n)
     # for running_score, running_cost in zip(running_scores[n], running_costs[n]):
