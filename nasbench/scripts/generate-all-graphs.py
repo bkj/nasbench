@@ -3,7 +3,7 @@
 """
   generate-all-graphs.py
   
-  time python generate-all-graphs.py | gzip -c > all-graphs.gz
+  python generate-all-graphs.py | gzip -c > all-graphs.gz
 """
 
 import sys
@@ -18,7 +18,7 @@ max_vertices = 7
 num_ops      = 3
 max_edges    = 9
 
-def _fn(vertices, bits):
+def make_graphs(vertices, bits):
     matrix = np.fromfunction(graph_util.gen_is_edge_fn(bits), (vertices, vertices), dtype=np.int8)
     
     if graph_util.num_edges(matrix) > max_edges:
@@ -46,7 +46,7 @@ for vertices in range(2, max_vertices+1):
     adjs.append((vertices, bits))
 
 adjs = [adjs[i] for i in np.random.permutation(len(adjs))]
-jobs = [delayed(_fn)(*adj) for adj in adjs]
+jobs = [delayed(make_graphs)(*adj) for adj in adjs]
 res  = Parallel(n_jobs=40, backend='multiprocessing', verbose=10)(jobs)
 
 for r in res:
